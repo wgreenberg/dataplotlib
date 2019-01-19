@@ -4,6 +4,7 @@
 
 use std::time::Duration;
 use std::{mem, thread, f64};
+use std::sync::mpsc::{Receiver};
 
 use plotbuilder::*;
 
@@ -123,11 +124,31 @@ fn clip_line(mut a: (f64, f64), mut b: (f64, f64), view: Range2d) -> Option<((f6
     return clip_line(a, b, view);
 }
 
-fn draw_plots(renderer: &mut Drawable, xs: &Vec<Vec<f64>>, ys: &Vec<Vec<f64>>, colors: &Vec<[f32; 4]>, plot_bounds: [f64; 4]) {
+fn draw_plots(renderer: &mut Drawable, mut plot_builder: PlotBuilder2D, maybe_channel: Option<Receiver<PlotBuilder2D>>) {
     let bordercol = f32_4_to_color([0.95, 0.95, 0.95, 1.0]);
     let bgcol = f32_4_to_color([1.0, 1.0, 1.0, 1.0]);
     let margin = 0.05;
 
+    let mut pvs = Vec::new();
+
+    mem::swap(&mut plot_builder.pvs, &mut pvs);
+
+    let mut colors: Vec<[f32; 4]> = Vec::new();
+    let mut xs: Vec<Vec<f64>> = Vec::new();
+    let mut ys: Vec<Vec<f64>> = Vec::new();
+
+    for pv in pvs.drain(..) {
+        match pv {
+            PlotVals2D::XyColor(ref col, ref xy) => {
+                set_xy(xy, &mut xs, &mut ys);
+                colors.push(col.clone());
+            }
+            _ => (),
+        }
+    }
+
+    // [MAX_X, MAX_Y, MIN_X, MIN_Y]
+    let plot_bounds: [f64; 4] = get_plot_bounds(&plot_builder, &xs, &ys);
     let w = Range {
         min: plot_bounds[2],
         max: plot_bounds[0],
@@ -137,10 +158,9 @@ fn draw_plots(renderer: &mut Drawable, xs: &Vec<Vec<f64>>, ys: &Vec<Vec<f64>>, c
         min: plot_bounds[3],
         max: plot_bounds[1],
     };
-
     renderer.set_view(Range2d(w, h));
 
-    let update_frame = |renderer: &mut Drawable| {
+    let update_frame = |renderer: &mut Drawable, ys: &Vec<Vec<f64>>, xs: &Vec<Vec<f64>>, colors: &Vec<[f32; 4]>| {
         let Range2d(w, h) = renderer.get_view();
 
         // calculate margins around plot
@@ -190,11 +210,48 @@ fn draw_plots(renderer: &mut Drawable, xs: &Vec<Vec<f64>>, ys: &Vec<Vec<f64>>, c
         renderer.set_view(Range2d(w, h));
     };
 
-
-    update_frame(renderer);
+    update_frame(renderer, &ys, &xs, &colors);
 
     'main: loop {
         let mut update = false;
+        if let Some(chan) = &maybe_channel {
+            // We only care about the most recently submitted plot
+            if let Some(mut new_plot_builder) = chan.try_iter().last() {
+                let mut pvs = Vec::new();
+
+                mem::swap(&mut new_plot_builder.pvs, &mut pvs);
+
+                xs.clear();
+                ys.clear();
+                colors.clear();
+
+                for pv in pvs.drain(..) {
+                    match pv {
+                        PlotVals2D::XyColor(ref col, ref xy) => {
+                            set_xy(xy, &mut xs, &mut ys);
+                            colors.push(col.clone());
+                        }
+                        _ => (),
+                    }
+                }
+
+                // [MAX_X, MAX_Y, MIN_X, MIN_Y]
+                let plot_bounds: [f64; 4] = get_plot_bounds(&new_plot_builder, &xs, &ys);
+                let w = Range {
+                    min: plot_bounds[2],
+                    max: plot_bounds[0],
+                };
+
+                let h = Range {
+                    min: plot_bounds[3],
+                    max: plot_bounds[1],
+                };
+                renderer.set_view(Range2d(w, h));
+
+                update = true;
+            }
+        }
+
         for event in renderer.get_events() {
             match event {
                 Event::Quit { .. } => break 'main,
@@ -229,7 +286,7 @@ fn draw_plots(renderer: &mut Drawable, xs: &Vec<Vec<f64>>, ys: &Vec<Vec<f64>>, c
         }
 
         if update {
-            update_frame(renderer);
+            update_frame(renderer, &ys, &xs, &colors);
         }
 
         thread::sleep(Duration::from_millis(16));
@@ -237,7 +294,6 @@ fn draw_plots(renderer: &mut Drawable, xs: &Vec<Vec<f64>>, ys: &Vec<Vec<f64>>, c
 }
 
 fn get_plot_bounds(plot_builder: &PlotBuilder2D, xs: &Vec<Vec<f64>>, ys: &Vec<Vec<f64>>) -> [f64; 4] {
-
     let mut max_xs: Vec<f64> = Vec::new();
     let mut max_ys: Vec<f64> = Vec::new();
     let mut min_xs: Vec<f64> = Vec::new();
@@ -264,27 +320,14 @@ fn get_plot_bounds(plot_builder: &PlotBuilder2D, xs: &Vec<Vec<f64>>, ys: &Vec<Ve
 }
 
 impl Plot {
-    pub fn new2d(mut plot_builder: PlotBuilder2D, mut renderer: Box<Drawable>) {
-        let mut pvs = Vec::new();
+    pub fn new2d(plot_builder: PlotBuilder2D, mut renderer: Box<Drawable>) {
+        draw_plots(&mut *renderer, plot_builder, None);
+    }
 
-        mem::swap(&mut plot_builder.pvs, &mut pvs);
-
-        let mut colors: Vec<[f32; 4]> = Vec::new();
-        let mut x_points: Vec<Vec<f64>> = Vec::new();
-        let mut y_points: Vec<Vec<f64>> = Vec::new();
-
-        for pv in pvs.drain(..) {
-            match pv {
-                PlotVals2D::XyColor(ref col, ref xy) => {
-                    set_xy(xy, &mut x_points, &mut y_points);
-                    colors.push(col.clone());
-                }
-                _ => (),
-            }
+    pub fn new2d_channel(mut renderer: Box<Drawable>, chan: Receiver<PlotBuilder2D>) {
+        match chan.recv() {
+            Ok(plot_builder) => draw_plots(&mut *renderer, plot_builder, Some(chan)),
+            _ => eprintln!("PlotBuilder2D channel error, exiting plot thread"),
         }
-
-        // [MAX_X, MAX_Y, MIN_X, MIN_Y]
-        let plot_bounds: [f64; 4] = get_plot_bounds(&plot_builder, &x_points, &y_points);
-        draw_plots(&mut *renderer, &x_points, &y_points, &colors, plot_bounds);
     }
 }

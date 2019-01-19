@@ -9,6 +9,7 @@
 use std::thread;
 use plotbuilder::PlotBuilder2D;
 use plot::Plot;
+use std::sync::mpsc;
 use draw;
 
 pub struct Plotter {
@@ -21,11 +22,21 @@ impl Plotter {
         Plotter { plots: Vec::new() }
     }
 
-    /// `plot2d` is currently the only supported plotting function. It takes a `PlotBuilder2D` containing all needed information.
+    /// `plot2d` takes a `PlotBuilder2D` containing all needed information.
     pub fn plot2d(&mut self, plotbuilder: PlotBuilder2D, drawable: Box<draw::Drawable>) {
         self.plots.push(thread::spawn(
             move || { Plot::new2d(plotbuilder, drawable); },
         ));
+    }
+
+    /// `plot2d_channel` allows for sending different `PlotBuilder2D` values over time via an
+    /// `mpsc::Sender`
+    pub fn plot2d_channel(&mut self, drawable: Box<draw::Drawable>) -> mpsc::Sender<PlotBuilder2D> {
+        let (send, recv) = mpsc::channel();
+        self.plots.push(thread::spawn(
+            move || { Plot::new2d_channel(drawable, recv); },
+        ));
+        send
     }
 
     /// The `disown` function allows the thread that owns the `Plotter` to keep going without either `join`ing manually or letting the `Drop` trait force a `join`.
